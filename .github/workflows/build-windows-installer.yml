@@ -1,0 +1,125 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref or SHA to build (leave empty for the checked-out ref)'
+        required: false
+        default: ''
+  push:
+    branches:
+      - main
+      - 'build-win**'
+    paths:
+      - '.github/workflows/build-windows-installer.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows x64 NSIS installer
+    runs-on: windows-latest
+    timeout-minutes: 75
+    env:
+      NODE_OPTIONS: '--max_old_space_size=4096'
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      ELECTRON_BUILDER_CACHE: '${{ github.workspace }}\.cache\electron-builder'
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.event.inputs.ref || github.sha }}
+
+      - name: Show build target
+        shell: pwsh
+        run: |
+          Write-Output "repo      : $env:GITHUB_REPOSITORY"
+          Write-Output "ref       : $env:GITHUB_REF"
+          Write-Output "sha       : $env:GITHUB_SHA"
+          git log --oneline -1
+          (Get-Content package.json -Raw | ConvertFrom-Json) |
+            Select-Object name, version, packageManager | Format-List
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.9
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Cache electron-builder binaries
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}\.cache\electron-builder
+          key: ${{ runner.os }}-electron-builder-${{ hashFiles('package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-electron-builder-
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build renderer
+        run: pnpm run electron:build:renderer
+
+      - name: Build main and preload bundles
+        run: pnpm run electron:build:deps
+
+      - name: Package NSIS installer
+        run: pnpm exec electron-builder --win --publish never
+
+      - name: Inspect output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist)) { throw 'dist/ was not produced' }
+          Get-ChildItem dist -Recurse -File |
+            Where-Object { $_.Name -match '\.(exe|blockmap|yml|zip)$' } |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize
+          $exe = Get-ChildItem dist -Filter '*.exe' -File
+          if (-not $exe) { throw 'No .exe installer found in dist/' }
+          "INSTALLER_NAME=$($exe[0].Name)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "INSTALLER_SIZE=$($exe[0].Length)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Get-FileHash $exe[0].FullName -Algorithm SHA256 |
+            ForEach-Object { "INSTALLER_SHA256=$($_.Hash)" } | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: bolt-diy-windows-${{ github.sha }}
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest*.yml
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: win-build-${{ github.run_number }}
+          name: Bolt.diy Windows build ${{ github.run_number }} (${{ github.sha }})
+          body: |
+            Automated Windows x64 build of `stackblitz-labs/bolt.diy`.
+
+            - Source commit: `${{ github.sha }}`
+            - Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            - Installer: `${{ env.INSTALLER_NAME }}`
+            - Size: `${{ env.INSTALLER_SIZE }}` bytes
+            - SHA256: `${{ env.INSTALLER_SHA256 }}`
+          draft: false
+          prerelease: true
+          files: dist/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
