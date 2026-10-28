@@ -13,6 +13,7 @@ import {
   createChatFromMessages,
   createChatWithNextId,
   setSnapshot,
+  getDefaultChatDescription,
   type IChatMetadata,
 } from './db';
 import { createMessage, getMessageAnnotations, hasMessageFlag, type AnyPart } from './messageMigration';
@@ -213,7 +214,19 @@ export function useChatHistory({ loadHistory = true }: { loadHistory?: boolean }
               archivedMessages = storedMessages.messages.slice(0, startingIdx + 1);
             }
 
-            if (startingIdx > 0 && validSnapshot.preserveMessagesOnRestore) {
+            /*
+             * Snapshots exist to restore the *project files* after a reload. They
+             * must not hide the conversation that produced those files: the
+             * previous default collapsed every reopened chat into one synthetic
+             * "Bolt Restored your chat from a snapshot" message, so the user saw
+             * an empty conversation and the model lost all prior context.
+             *
+             * Older snapshots were written without this field, so `undefined`
+             * must mean "keep the messages" as well.
+             */
+            const preserveMessagesOnRestore = validSnapshot.preserveMessagesOnRestore !== false;
+
+            if (startingIdx >= 0 && preserveMessagesOnRestore) {
               archivedMessages = [];
               await restoreSnapshot(validSnapshot, isCurrentLoad);
 
@@ -445,6 +458,11 @@ ${value.content}
         chatIndex: chatIdx,
         files,
         summary: chatSummary,
+        /*
+         * Restoring a chat must rebuild the workbench from the snapshot while
+         * keeping the full message history in view and in the model context.
+         */
+        preserveMessagesOnRestore: true,
       };
 
       // localStorage.setItem(`snapshot:${id}`, JSON.stringify(snapshot)); // Remove localStorage usage
@@ -573,8 +591,14 @@ ${value.content}
           }
         }
 
-        if (!description.get() && firstArtifact?.title) {
-          description.set(firstArtifact?.title);
+        if (!description.get()) {
+          /*
+           * `firstArtifact.title` only exists once the model has produced code.
+           * A plain question has no artifact, and without a description the
+           * sidebar entry is filtered out and the chat looks lost after a
+           * restart. Fall back to the first user message.
+           */
+          description.set(firstArtifact?.title || getDefaultChatDescription(messages) || 'New chat');
         }
 
         // Ensure chatId.get() is used here as well
@@ -594,7 +618,12 @@ ${value.content}
               _urlId,
               description.get(),
               chatMetadata.get(),
-              Boolean(_urlId),
+              /*
+               * Always allocate a public `urlId` for a brand new chat, even when
+               * no artifact exists yet. Otherwise the record is stored with
+               * `urlId: undefined` and never shows up in the sidebar.
+               */
+              true,
             );
             pendingChatCreationRef.current = creationPromise;
           }

@@ -65,9 +65,53 @@ export async function getAll(db: IDBDatabase): Promise<ChatHistoryItem[]> {
      * already migrated on disk is a no-op.
      */
     request.onsuccess = () =>
-      resolve((request.result as ChatHistoryItem[]).map(migrateChatMessages) as ChatHistoryItem[]);
+      resolve(
+        (request.result as ChatHistoryItem[]).map((chat) => {
+          const migrated = migrateChatMessages(chat);
+
+          /*
+           * Chats created before an artifact existed were persisted with
+           * `urlId` and `description` both undefined. The sidebar filters on
+           * those fields, so such chats stayed reachable in IndexedDB but were
+           * invisible in the history list forever. Backfill a stable public id
+           * from the record id and a readable description from the first user
+           * message so legacy chats become selectable again.
+           */
+          return {
+            ...migrated,
+            urlId: migrated.urlId || migrated.id,
+            description: migrated.description || getDefaultChatDescription(migrated.messages) || 'New chat',
+          } as ChatHistoryItem;
+        }) as ChatHistoryItem[],
+      );
     request.onerror = () => reject(request.error);
   });
+}
+
+function extractTextFromMessage(message: UIMessage): string {
+  const value = message as unknown as { content?: unknown; parts?: Array<{ type?: string; text?: unknown }> };
+
+  if (typeof value?.content === 'string' && value.content.trim()) {
+    return value.content;
+  }
+
+  const parts = Array.isArray(value?.parts) ? value.parts : [];
+
+  return parts
+    .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+    .map((part) => part.text as string)
+    .join(' ');
+}
+
+/*
+ * Human readable fallback title for a chat that never produced an artifact.
+ * Without it the sidebar entry exists but renders as a blank row.
+ */
+export function getDefaultChatDescription(messages: UIMessage[] | undefined): string | undefined {
+  const firstUserMessage = (messages || []).find((message) => message?.role === 'user');
+  const text = firstUserMessage ? extractTextFromMessage(firstUserMessage).replace(/\s+/g, ' ').trim() : '';
+
+  return text ? text.slice(0, 60) : undefined;
 }
 
 /*
